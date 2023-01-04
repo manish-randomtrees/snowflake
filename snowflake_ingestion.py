@@ -2,6 +2,7 @@ import os
 import snowflake.connector as sf
 from snowflake.connector.pandas_tools import write_pandas
 import pandas as pd
+from snowflake.snowpark.session import Session
 
 
 train_df = pd.read_csv("diabetes.csv")
@@ -36,4 +37,18 @@ cols = ', '.join(cols)
 #print(f"""CREATE OR REPLACE TABLE TRAIN_DATA ( {cols},{target_column} float );""")
 # cs.execute(f"""CREATE OR REPLACE TABLE TRAIN_DATA( {cols},{target_column} float )""")
 cs.execute(f"""CREATE OR REPLACE TABLE {train_data_name}(""" + cols + """)""")
+train_df.columns = [x.upper() for x in train_df.columns]
+
+CONNECTION_PARAMETERS = {
+   "account": 'nq81064.us-east4.gcp',
+   "user": 'MAK',
+   "password": 'Rocky1234',
+   "database": 'snowml',
+   "schema": 'demo',
+   "role":'accountadmin',
+   "warehouse": 'compute_wh'
+}
+session = Session.builder.configs(CONNECTION_PARAMETERS).create()
+
+snowpark_df = session.write_pandas(train_df, "DEMAND_FORECASTING")
 
