@@ -52,3 +52,5 @@ session = Session.builder.configs(CONNECTION_PARAMETERS).create()
 
 snowpark_df = session.write_pandas(train_df, "DEMAND_FORECASTING")
 
+if(__name__=="__main__"):
+    uvicorn.run("main:app",reload=True)
