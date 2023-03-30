@@ -1,0 +1,147 @@
+import pandas as pd
+import snowflake.connector as sf
+import snowflake.snowpark
+from snowflake.connector.pandas_tools import write_pandas
+import pandas as pd
+from snowflake.snowpark.session import Session
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor,RandomForestClassifier
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import make_column_transformer
+from snowflake.snowpark.functions import sproc
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import mean_squared_error,r2_score,mean_absolute_error,confusion_matrix, f1_score, accuracy_score,recall_score,precision_score
+
+
+import pandas as pd
+import cachetools
+import os,sys
+import joblib
+import io
+
+train_df=pd.read_csv("train.csv")
+cnn = sf.connect(user="manishreddy",password="S@ndhya03",account="uh65542.europe-west4.gcp",warehouse="compute_wh",database="test",schema="public")
+CONNECTION_PARAMETERS = {
+   "account": 'uh65542.europe-west4.gcp',
+   "user": 'manishreddy',
+   "password": 'S@ndhya03',
+   "database": 'test',
+   "schema": 'public',
+   "role":'accountadmin',
+   "warehouse": 'compute_wh'
+}
+session = Session.builder.configs(CONNECTION_PARAMETERS).create()
+session.add_packages('snowflake-snowpark-python', 'scikit-learn', 'pandas', 'numpy', 'joblib', 'cachetools')
+
+def save_file(session, model, path):
+  input_stream = io.BytesIO()
+  joblib.dump(model, input_stream)
+  session._conn._cursor.upload_stream(input_stream, path)
+  return "successfully created file: " + path
+
+@sproc(name="model",replace=True,is_permanent=True,stage_location="@model_function/models/",packages=["snowflake-snowpark-python", 'scikit-learn', 'pandas', 'numpy', 'joblib', 'cachetools'])
+def build_model(snowpark_session:snowflake.snowpark.Session,model_name: str,model_type:str,sql:str,target_column:str)->str:
+    if model_type=="RandomforestRegressor":
+        results_df = snowpark_session.sql(sql)
+        df=results_df.to_pandas()
+        rf=RandomForestRegressor(random_state=42)
+        features_to_encode = df.columns[df.dtypes==object].tolist()  
+        col_trans = make_column_transformer(
+                        (OneHotEncoder(),features_to_encode),
+                        remainder = "passthrough"
+                        )
+        pipe = make_pipeline(col_trans, rf)
+        df_feature=df.drop([target_column],axis=1)
+        df_target=df[target_column]
+        pipe.fit(df_feature,df_target)
+        input_stream = io.BytesIO()
+        joblib.dump(pipe, input_stream)
+        snowpark_session._conn._cursor.upload_stream(input_stream, f"@model_function/models/{model_name}.joblib")
+        return "success"
+    elif model_type=="RandomForestClassifier":
+        results_df = snowpark_session.sql(sql)
+        df=results_df.to_pandas()
+        rf=RandomForestClassifier(random_state=42)
+        features_to_encode = df.columns[df.dtypes==object].tolist()  
+        col_trans = make_column_transformer(
+                        (OneHotEncoder(),features_to_encode),
+                        remainder = "passthrough"
+                        )
+        pipe = make_pipeline(col_trans, rf)
+        df_feature=df.drop([target_column],axis=1)
+        df_target=df[target_column]
+        pipe.fit(df_feature,df_target)
+        input_stream = io.BytesIO()
+        joblib.dump(pipe, input_stream)
+        snowpark_session._conn._cursor.upload_stream(input_stream, f"@model_function/models/{model_name}.joblib")
+        # snowpark_session.file.put(input_stream, "@model_function/models/", auto_compress=False, overwrite=True)
+        return "success"
+    return "model type specified doesnt exist"
+
+@cachetools.cached(cache={})
+def read_file(filename):
+    import_dir = sys._xoptions.get("snowflake_import_directory")
+    if import_dir:
+        if os.path.isfile(os.path.join(import_dir, filename)):
+            with open(os.path.join(import_dir, filename), 'rb') as file:
+                    m = joblib.load(file)
+                    return m
+    return None
+
+@sproc(name="predict",replace=True,is_permanent=True,stage_location="@model_function/models/",packages=["snowflake-snowpark-python", 'scikit-learn', 'pandas', 'numpy', 'joblib', 'cachetools'])
+def predict(snowpark_session:snowflake.snowpark.Session,model_name: str,sql:str)->list:
+    # snowpark_session.add_import(f"@model_function/models/{model_name}.joblib")
+    # model=read_file(f"{model_name}.joblib")
+    # import_dir = sys._xoptions["snowflake_import_directory"]
+    # model=None
+    # if import_dir:
+    #     with open(os.path.join(import_dir, f"{model_name}.joblib"), 'rb') as file:
+    #         model= joblib.load(file)
+    file=snowpark_session.file.get_stream(f"@model_function/models/{model_name}.joblib", decompress=False)
+    model= joblib.load(file)
+    if model is not None:
+        test_df = snowpark_session.sql(sql)
+        df=test_df.to_pandas()
+        results=model.predict(df)
+        results_df=pd.DataFrame(results,columns=['price_range'],index=df.index.copy())
+        result=snowpark_session.write_pandas(results_df, f"{model_name.upper()}_PREDS",auto_create_table=True,overwrite=True)
+        return ["success"]
+    return ["model name specified doesnt exist"]
+# train_model_sp = sproc(build_model, replace=True,name="model",is_permanent=True,stage_location="model_function")
+
+@sproc(name="regressions_metrics",replace=True,is_permanent=True,stage_location="@model_function/models/",packages=["snowflake-snowpark-python", 'scikit-learn', 'pandas', 'numpy', 'joblib', 'cachetools'])
+def regressions_metrics(snowpark_session:snowflake.snowpark.Session,model_name:str,y_test: str,preds:str)->list:
+    ytest = snowpark_session.sql(y_test).to_pandas()
+    ytest.columns=['test']
+    ytest.reset_index(drop=True,inplace=True)
+    pred = snowpark_session.sql(preds).to_pandas()
+    pred.columns=['test']
+    pred.reset_index(drop=True,inplace=True)
+    l=[]
+    l.append(model_name)
+    l.append(mean_squared_error(ytest,pred))
+    l.append(mean_absolute_error(ytest,pred))
+    l.append(r2_score(ytest,pred))
+    df=pd.DataFrame([l],columns=['model name','mean_squared_error','mean_absolute_error','r2_score'])
+    result=snowpark_session.write_pandas(df, "MODEL_REGRESSION_METRICS",auto_create_table=True,overwrite=True)
+    result = list(df.to_dict('dict').items())
+    return result
+@sproc(name="classification_metrics",replace=True,is_permanent=True,stage_location="@model_function/models/",packages=["snowflake-snowpark-python", 'scikit-learn', 'pandas', 'numpy', 'joblib', 'cachetools'])
+def classification_metrics(snowpark_session:snowflake.snowpark.Session,model_name:str,y_test: str,preds:str)->list:
+    ytest = snowpark_session.sql(y_test).to_pandas()
+    ytest.columns=['test']
+    ytest.reset_index(drop=True,inplace=True)
+    pred = snowpark_session.sql(preds).to_pandas()
+    pred.columns=['test']
+    pred.reset_index(drop=True,inplace=True)
+    l=[]
+    l.append(model_name)
+    l.append(f1_score(ytest,pred,average='macro'))
+    l.append(accuracy_score(ytest,pred))
+    l.append(confusion_matrix(ytest,pred).tolist())
+    l.append(precision_score(ytest,pred,average='macro'))
+    l.append(recall_score(ytest,pred,average='macro'))
+    df=pd.DataFrame([l],columns=['model name','f1_score','accuracy_score','confusion_matrix','precision_score','recall_score'])
+    result=snowpark_session.write_pandas(df, "MODEL_CLASSIFICATION_METRICS",auto_create_table=True,overwrite=True)
+    result = list(df.to_dict('dict').items())
+    return result
